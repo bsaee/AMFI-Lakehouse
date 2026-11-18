@@ -17,3 +17,8 @@
 - **Final Silver `nav_daily` Row Count:** 6,014,674 rows
 - **Final Silver `scheme_dim` Row Count:** 14,433 schemes
 - **Total Quarantined Rows (`quarantine`):** 8,848 rows
+
+## Phase 5: Gold Analytics (Spark SQL Window Functions)
+- **`gold/fund_daily_metrics` Row Count:** 6,014,674 rows (daily return, 30D annualized volatility, running drawdown)
+- **`gold/category_leaderboard` Row Count:** 14,433 schemes (1M/1Y/3Y CAGR returns & `DENSE_RANK()` by category)
+- **Full Gold Build Runtime:** 251.75s (~4.2 min) locally on 6.01M rows
