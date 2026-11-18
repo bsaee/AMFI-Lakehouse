@@ -9,7 +9,6 @@ from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
-    DateType,
     DoubleType,
     IntegerType,
     StringType,
@@ -19,6 +18,7 @@ from pyspark.sql.types import (
 
 from amfi_lakehouse.config import BRONZE_DIR, SILVER_DIR
 from amfi_lakehouse.parse import parse_bronze_file
+from amfi_lakehouse.quality import split_valid_and_quarantine
 from amfi_lakehouse.spark_session import get_spark_session
 
 logging.basicConfig(
@@ -35,6 +35,8 @@ RAW_PARSED_SCHEMA = StructType(
         StructField("isin_growth", StringType(), nullable=True),
         StructField("isin_reinvest", StringType(), nullable=True),
         StructField("scheme_name", StringType(), nullable=False),
+        StructField("plan", StringType(), nullable=True),
+        StructField("option", StringType(), nullable=True),
         StructField("nav", DoubleType(), nullable=True),
         StructField("nav_date", StringType(), nullable=True),
         StructField("amc_name", StringType(), nullable=True),
@@ -78,7 +80,10 @@ def merge_into_delta(
         writer.save(target_str)
 
 
-def run_silver_pipeline(ingestion_date: str | None = None) -> dict:
+def run_silver_pipeline(
+    ingestion_date: str | None = None,
+    min_expected_rows: int = 10_000,
+) -> dict:
     start_time = time.perf_counter()
     run_date = ingestion_date or datetime.now(IST).strftime("%Y-%m-%d")
     bronze_file = BRONZE_DIR / "nav_all" / f"ingestion_date={run_date}" / "NAVAll.txt"
@@ -94,39 +99,30 @@ def run_silver_pipeline(ingestion_date: str | None = None) -> dict:
     try:
         raw_df = spark.createDataFrame(parsed_rows, schema=RAW_PARSED_SCHEMA)
 
-        # Basic Silver filter (Phase 3 will route invalid rows to quarantine)
-        valid_df = (
-            raw_df.filter(
-                F.col("nav").isNotNull()
-                & (F.col("nav") > 0)
-                & F.col("nav_date").isNotNull()
-            )
-            .withColumn("nav_date", F.to_date("nav_date", "yyyy-MM-dd").cast(DateType()))
-            .withColumn("ingestion_date", F.to_date("ingestion_date", "yyyy-MM-dd").cast(DateType()))
+        # Phase 3: Pandera validation & quarantine routing
+        valid_df, quarantine_df, quality_report = split_valid_and_quarantine(
+            raw_df=raw_df,
+            run_date=run_date,
+            min_expected_rows=min_expected_rows,
         )
 
-        # 1. Prepare nav_daily fact table
-        fact_df = valid_df.select(
-            "scheme_code",
-            "nav_date",
-            "nav",
-            "ingestion_date",
-        )
-        fact_deduped = _dedupe_latest(fact_df, ["scheme_code", "nav_date"], "ingestion_date")
-
+        # 1. Merge valid rows into nav_daily fact table
+        fact_df = valid_df.select("scheme_code", "nav_date", "nav", "ingestion_date")
         nav_daily_path = SILVER_DIR / "nav_daily"
         merge_into_delta(
             spark=spark,
-            source_df=fact_deduped,
+            source_df=fact_df,
             target_path=nav_daily_path,
             merge_condition="target.scheme_code = source.scheme_code AND target.nav_date = source.nav_date",
             partition_cols=["nav_date"],
         )
 
-        # 2. Prepare scheme_dim dimension table
+        # 2. Merge scheme metadata into scheme_dim dimension table
         dim_df = valid_df.select(
             "scheme_code",
             "scheme_name",
+            "plan",
+            "option",
             "amc_name",
             "scheme_category",
             "isin_growth",
@@ -134,7 +130,6 @@ def run_silver_pipeline(ingestion_date: str | None = None) -> dict:
             F.col("nav_date").alias("last_seen_date"),
         )
         dim_deduped = _dedupe_latest(dim_df, ["scheme_code"], "last_seen_date")
-
         scheme_dim_path = SILVER_DIR / "scheme_dim"
         merge_into_delta(
             spark=spark,
@@ -143,22 +138,42 @@ def run_silver_pipeline(ingestion_date: str | None = None) -> dict:
             merge_condition="target.scheme_code = source.scheme_code",
         )
 
-        # Verify via Spark SQL
+        # 3. Merge bad rows into quarantine table (idempotent per scheme_code + ingestion_date)
+        quarantine_path = SILVER_DIR / "quarantine"
+        if quality_report["quarantined_rows"] > 0:
+            quarantine_deduped = _dedupe_latest(
+                quarantine_df, ["scheme_code", "ingestion_date"], "quarantined_at"
+            )
+            merge_into_delta(
+                spark=spark,
+                source_df=quarantine_deduped,
+                target_path=quarantine_path,
+                merge_condition=(
+                    "target.scheme_code = source.scheme_code "
+                    "AND target.ingestion_date = source.ingestion_date"
+                ),
+                partition_cols=["ingestion_date"],
+            )
+
         nav_count = spark.read.format("delta").load(str(nav_daily_path)).count()
         dim_count = spark.read.format("delta").load(str(scheme_dim_path)).count()
-        invalid_count = raw_df.count() - valid_df.count()
+        quarantine_total = (
+            spark.read.format("delta").load(str(quarantine_path)).count()
+            if quarantine_path.exists()
+            else 0
+        )
         elapsed = round(time.perf_counter() - start_time, 3)
 
         metrics = {
             "ingestion_date": run_date,
             "parsed_rows": len(parsed_rows),
-            "valid_rows": valid_df.count(),
-            "filtered_out_rows": invalid_count,
+            **quality_report,
             "silver_nav_daily_total_rows": nav_count,
             "silver_scheme_dim_total_rows": dim_count,
+            "silver_quarantine_total_rows": quarantine_total,
             "runtime_sec": elapsed,
         }
-        logger.info("Silver MERGE complete: %s", json.dumps(metrics))
+        logger.info("Silver + Quality pipeline complete: %s", json.dumps(metrics))
         return metrics
     finally:
         spark.stop()
