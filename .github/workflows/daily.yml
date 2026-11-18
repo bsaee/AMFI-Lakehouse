@@ -1,0 +1,66 @@
+name: Daily AMFI Lakehouse ETL
+
+on:
+  schedule:
+    # Runs Monday-Friday at 17:30 UTC (11:00 PM IST, after AMFI publishes daily NAVs)
+    - cron: "30 17 * * 1-5"
+  workflow_dispatch: # Allows manual one-click trigger from GitHub Actions UI
+
+permissions:
+  contents: write # Needed to read/update the rolling GitHub Release state asset
+
+jobs:
+  daily-etl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore prior Lakehouse state from GitHub Release (if available)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data
+          if gh release view lakehouse-latest >/dev/null 2>&1; then
+            echo "Downloading existing lakehouse_state.tar.gz..."
+            gh release download lakehouse-latest -p "lakehouse_state.tar.gz" -D /tmp
+            tar -xzf /tmp/lakehouse_state.tar.gz -C .
+          else
+            echo "No prior release found; initializing fresh lakehouse state."
+          fi
+
+      - name: Run Bronze -> Silver -> Gold daily pipeline
+        env:
+          PYTHONPATH: src
+        run: python -m amfi_lakehouse.pipeline
+
+      - name: Persist updated Lakehouse state to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf /tmp/lakehouse_state.tar.gz data/silver data/gold
+          if ! gh release view lakehouse-latest >/dev/null 2>&1; then
+            gh release create lakehouse-latest /tmp/lakehouse_state.tar.gz \
+              --title "Lakehouse State (Latest)" \
+              --notes "Automated rolling Delta Lakehouse snapshot (Silver + Gold)."
+          else
+            gh release upload lakehouse-latest /tmp/lakehouse_state.tar.gz --clobber
+          fi
