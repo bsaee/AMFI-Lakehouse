@@ -34,11 +34,15 @@ def parse_amfi_lines(lines: list[str], ingestion_date: str) -> list[dict]:
     """
     Parse AMFI NAV text lines containing interleaved category headers,
     AMC headers, and semicolon-delimited fund NAV rows.
-    Supports both 8-column (with Plan, Option) and legacy 6-column AMFI formats.
+    Automatically adapts to:
+      - Daily 8-col layout: Scheme Code;ISIN Growth;ISIN Reinvest;Scheme Name;Plan;Option;NAV;Date
+      - History 8-col layout: Scheme Code;NAV Name;Plan;Option;ISIN Growth;ISIN Reinvest;NAV;Date
+      - Legacy 6-col layout: Scheme Code;ISIN Growth;ISIN Reinvest;Scheme Name;NAV;Date
     """
     records: list[dict] = []
     current_category: str | None = None
     current_amc: str | None = None
+    layout = "daily_8"  # default for NAVAll.txt
 
     for raw_line in lines:
         line = raw_line.strip()
@@ -46,6 +50,13 @@ def parse_amfi_lines(lines: list[str], ingestion_date: str) -> list[dict]:
             continue
 
         if line.startswith("Scheme Code;"):
+            header_cols = [c.strip().lower() for c in line.split(";")]
+            if len(header_cols) >= 8 and header_cols[1].startswith("nav name"):
+                layout = "history_8"
+            elif len(header_cols) >= 8:
+                layout = "daily_8"
+            else:
+                layout = "legacy_6"
             continue
 
         parts = line.split(";")
@@ -62,16 +73,26 @@ def parse_amfi_lines(lines: list[str], ingestion_date: str) -> list[dict]:
         if not scheme_code_str.isdigit():
             continue
 
-        # Current 8-column layout:
-        # Scheme Code;ISIN Growth;ISIN Reinvest;Scheme Name;Plan;Option;NAV;Date
-        if len(parts) >= 8:
+        if layout == "history_8" and len(parts) >= 8:
+            scheme_name = parts[1].strip()
+            plan = _clean_optional_str(parts[2])
+            option = _clean_optional_str(parts[3])
+            isin_growth = _clean_optional_str(parts[4])
+            isin_reinvest = _clean_optional_str(parts[5])
+            nav = _parse_nav(parts[6])
+            nav_date = _parse_date(parts[7])
+        elif layout == "daily_8" and len(parts) >= 8:
+            isin_growth = _clean_optional_str(parts[1])
+            isin_reinvest = _clean_optional_str(parts[2])
+            scheme_name = parts[3].strip()
             plan = _clean_optional_str(parts[4])
             option = _clean_optional_str(parts[5])
             nav = _parse_nav(parts[6])
             nav_date = _parse_date(parts[7])
-        # Legacy 6-column layout (used in some historical exports):
-        # Scheme Code;ISIN Growth;ISIN Reinvest;Scheme Name;NAV;Date
         elif len(parts) >= 6:
+            isin_growth = _clean_optional_str(parts[1])
+            isin_reinvest = _clean_optional_str(parts[2])
+            scheme_name = parts[3].strip()
             plan = None
             option = None
             nav = _parse_nav(parts[4])
@@ -82,9 +103,9 @@ def parse_amfi_lines(lines: list[str], ingestion_date: str) -> list[dict]:
         records.append(
             {
                 "scheme_code": int(scheme_code_str),
-                "isin_growth": _clean_optional_str(parts[1]),
-                "isin_reinvest": _clean_optional_str(parts[2]),
-                "scheme_name": parts[3].strip(),
+                "isin_growth": isin_growth,
+                "isin_reinvest": isin_reinvest,
+                "scheme_name": scheme_name,
                 "plan": plan,
                 "option": option,
                 "nav": nav,
