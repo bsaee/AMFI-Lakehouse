@@ -1,5 +1,6 @@
 pyspark[connect]==3.5.3
 delta-spark==3.2.1
+deltalake==0.21.0
 pandera[pyspark]==0.20.4
 pyarrow==17.0.0
 requests==2.32.3
